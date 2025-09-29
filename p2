@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from typing import List, Tuple
+
+
+def read_pgm(path: str) -> Tuple[List[List[int]], int, int, int]:
+    with open(path, 'rb') as f:
+        magic = f.readline().strip()
+        if magic not in [b'P2', b'P5']:
+            raise ValueError('Unsupported PGM format. Use P2 or P5.')
+
+        def _read_token() -> bytes:
+            token = b''
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    break
+                if ch.isspace():
+                    if token:
+                        break
+                    else:
+                        continue
+                if ch == b'#':
+                    # Skip comment line
+                    while ch not in [b'\n', b'']:
+                        ch = f.read(1)
+                    continue
+                token += ch
+            return token
+
+        def _read_int() -> int:
+            tok = _read_token()
+            if not tok:
+                raise ValueError('Unexpected EOF while reading header')
+            return int(tok)
+
+        # width, height, maxval
+        width = _read_int()
+        height = _read_int()
+        maxval = _read_int()
+
+        img: List[List[int]] = [[0] * width for _ in range(height)]
+        if magic == b'P2':
+            # ASCII
+            for y in range(height):
+                for x in range(width):
+                    img[y][x] = _read_int()
+        else:
+            # Binary
+            if maxval < 256:
+                row_bytes = width
+                for y in range(height):
+                    row = f.read(row_bytes)
+                    if len(row) != row_bytes:
+                        raise ValueError('Unexpected EOF in pixel data')
+                    img[y] = list(row)
+            else:
+                # 2 bytes per sample, big endian as per PGM spec
+                for y in range(height):
+                    row = []
+                    for _ in range(width):
+                        b = f.read(2)
+                        if len(b) != 2:
+                            raise ValueError('Unexpected EOF in pixel data')
+                        row.append((b[0] << 8) | b[1])
+                    img[y] = row
+
+        return img, width, height, maxval
+
+
+def write_pgm(path: str, img: List[List[int]], width: int, height: int, maxval: int = 255, binary: bool = True) -> None:
+    mode = 'wb' if binary else 'w'
+    with open(path, mode) as f:
+        if binary:
+            f.write(b'P5\n')
+            header = f"{width} {height}\n{maxval}\n".encode('ascii')
+            f.write(header)
+            for y in range(height):
+                row = bytes(min(max(val, 0), maxval) for val in img[y])
+                f.write(row)
+        else:
+            f.write('P2\n')
+            f.write(f"{width} {height}\n{maxval}\n")
+            for y in range(height):
+                f.write(' '.join(str(min(max(val, 0), maxval)) for val in img[y]))
+                f.write('\n')
+
+
+class UnionFind:
+    def __init__(self):
+        self.parent: List[int] = [0]
+        self.rank: List[int] = [0]
+
+    def make_set(self) -> int:
+        self.parent.append(len(self.parent))
+        self.rank.append(0)
+        return len(self.parent) - 1
+
+    def find(self, x: int) -> int:
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+
+    def union(self, a: int, b: int) -> None:
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            self.parent[ra] = rb
+        elif self.rank[ra] > self.rank[rb]:
+            self.parent[rb] = ra
+        else:
+            self.parent[rb] = ra
+            self.rank[ra] += 1
+
+
+def connected_component_labeling(binary: List[List[int]], width: int, height: int, connectivity8: bool = True) -> Tuple[List[List[int]], int]:
+    uf = UnionFind()
+    labels = [[0] * width for _ in range(height)]
+
+    neighbors_8 = [(-1, -1), (0, -1), (1, -1), (-1, 0)]
+    neighbors_4 = [(0, -1), (-1, 0)]
+    neighbors = neighbors_8 if connectivity8 else neighbors_4
+
+    # First pass
+    for y in range(height):
+        for x in range(width):
+            if binary[y][x] == 0:
+                continue
+            neighbor_labels = []
+            for dx, dy in neighbors:
+                nx = x + dx
+                ny = y + dy
+                if 0 <= nx < width and 0 <= ny < height and binary[ny][nx] != 0:
+                    if labels[ny][nx] != 0:
+                        neighbor_labels.append(labels[ny][nx])
+            if not neighbor_labels:
+                new_label = uf.make_set()
+                labels[y][x] = new_label
+            else:
+                min_label = min(neighbor_labels)
+                labels[y][x] = min_label
+                for other in neighbor_labels:
+                    uf.union(min_label, other)
+
+    # Second pass: resolve labels and compact to consecutive integers starting at 1
+    label_map = {}
+    next_label = 1
+    for y in range(height):
+        for x in range(width):
+            if labels[y][x] == 0:
+                continue
+            root = uf.find(labels[y][x])
+            if root not in label_map:
+                label_map[root] = next_label
+                next_label += 1
+            labels[y][x] = label_map[root]
+
+    return labels, next_label - 1
+
+
+def binarize(img: List[List[int]], threshold: int) -> List[List[int]]:
+    h = len(img)
+    w = len(img[0]) if h > 0 else 0
+    out = [[0] * w for _ in range(h)]
+    for y in range(h):
+        for x in range(w):
+            out[y][x] = 1 if img[y][x] > threshold else 0
+    return out
+
+
+def scale_labels_to_gray(labels: List[List[int]], width: int, height: int, num_labels: int) -> List[List[int]]:
+    if num_labels == 0:
+        return [[0] * width for _ in range(height)]
+    maxval = 255
+    step = max(1, maxval // num_labels)
+    gray = [[0] * width for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            lbl = labels[y][x]
+            gray[y][x] = 0 if lbl == 0 else min(255, lbl * step)
+    return gray
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Connected component labeling for binary PGM images.')
+    parser.add_argument('input', help='Input binary image (PGM P2/P5). Non-binary will be thresholded with --thresh.')
+    parser.add_argument('output', help='Output labeled image (PGM).')
+    parser.add_argument('--thresh', type=int, default=0, help='Threshold [0..maxval] to binarize non-binary input (default: 0>black).')
+    parser.add_argument('--ascii', action='store_true', help='Write ASCII P2 instead of binary P5.')
+    parser.add_argument('--4', dest='conn4', action='store_true', help='Use 4-connectivity instead of 8-connectivity.')
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    img, w, h, maxval = read_pgm(args.input)
+    # If the image is not strictly 0/1, binarize using threshold
+    is_binary = all((px == 0 or px == 1) for row in img for px in row)
+    binary = img if is_binary else binarize(img, args.thresh)
+    labels, n = connected_component_labeling(binary, w, h, connectivity8=not args.conn4)
+    gray = scale_labels_to_gray(labels, w, h, n)
+    write_pgm(args.output, gray, w, h, 255, binary=not args.ascii)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
